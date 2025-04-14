@@ -1,0 +1,118 @@
+package org.kafka.examples;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import io.confluent.kafka.serializers.KafkaAvroSerializerConfig;
+import io.confluent.kafka.serializers.json.KafkaJsonSchemaSerializer;
+import org.apache.kafka.clients.producer.Callback;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class KafkaJsonProducer {
+
+    // Report number of records sent every this many seconds.
+    private static final long PROGRESS_REPORTING_INTERVAL = 5;
+
+    private static Logger log = LoggerFactory.getLogger("KafkaJsonProducer");
+
+    public static void main(String[] args) throws InterruptedException, JsonProcessingException {
+
+        String TOPIC = "jsontopic";
+        int TOTAL_RECORDS = 1;
+        String BOOTSTRAP_SERVERS = "localhost:9192";
+        String SCHEMA_REGISTRY_URL = "http://localhost:8081";
+
+        if (args.length == 1) {
+            TOPIC = args[0];
+        }
+        else if (args.length == 2){
+            TOPIC = args[0];
+            TOTAL_RECORDS = Integer.parseInt(args[1]);
+        }
+        else if (args.length == 3){
+            TOPIC = args[0];
+            TOTAL_RECORDS = Integer.parseInt(args[1]);
+            BOOTSTRAP_SERVERS = args[2];
+        }
+        else if (args.length == 4){
+            TOPIC = args[0];
+            TOTAL_RECORDS = Integer.parseInt(args[1]);
+            BOOTSTRAP_SERVERS = args[2];
+            SCHEMA_REGISTRY_URL = args[3];
+        }
+
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP_SERVERS);
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaJsonSchemaSerializer.class.getName());
+        props.put(KafkaAvroSerializerConfig.SCHEMA_REGISTRY_URL_CONFIG, SCHEMA_REGISTRY_URL);
+        props.put(ProducerConfig.ACKS_CONFIG, "1");
+
+        log.info("Topic Name: {}, Total Records: {}, Bootstrap Servers: {}, Schema Registry URL: {}",
+                TOPIC, TOTAL_RECORDS, BOOTSTRAP_SERVERS, SCHEMA_REGISTRY_URL);
+
+        // Start a timer to measure how long this run takes overall.
+        Instant start = Instant.now();
+
+        final Producer<String, User> producer = new KafkaProducer<>(props);
+        Runtime.getRuntime().addShutdownHook(new Thread(producer::close, "Shutdown-thread"));
+
+
+        // Calculate the total number of records we expect to generate, an object
+        // to keep track of the number of errors we encounter, and a latch that
+        // will be signalled every time a "send" completes. This latch allows us
+        // to wait for all sends to complete before terminating the program.
+        AtomicLong errorCount = new AtomicLong();
+        CountDownLatch requestLatch = new CountDownLatch(TOTAL_RECORDS);
+
+        // Create a counter to track the number of records we've successfully
+        // created so far.
+        final AtomicLong successCount = new AtomicLong();
+
+        // This callback will be invoked whenever a send completes. It reports any
+        // errors (and bumps the error-count) and signals the latch as described above.
+        Callback postSender = (recordMetadata, e) -> {
+            if (e != null) {
+                log.error("Error adding to topic", e);
+                errorCount.incrementAndGet();
+            } else {
+                successCount.incrementAndGet();
+            }
+            requestLatch.countDown();
+        };
+
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+        scheduler.scheduleAtFixedRate(
+                () -> log.info("Successfully created {} Kafka records", successCount.get()),
+                2, PROGRESS_REPORTING_INTERVAL, TimeUnit.SECONDS);
+
+        for (int k = 0; k < TOTAL_RECORDS; k++) {
+            User user = new User(255);
+            producer.send(new ProducerRecord<>(TOPIC, "key", user), postSender);
+        }
+
+        // Wait for sends to complete.
+        requestLatch.await();
+
+        // Stop the thread that periodically reports progress.
+        scheduler.shutdown();
+        // shutdown producer
+        producer.close();
+        long duration = Duration.between(start, Instant.now()).getSeconds();
+        log.info("Completed loading {}/{} records to Kafka in {} seconds",
+                TOTAL_RECORDS - errorCount.get(), TOTAL_RECORDS, duration);
+    }
+}
